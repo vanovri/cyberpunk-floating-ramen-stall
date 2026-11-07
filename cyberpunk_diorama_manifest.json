@@ -121,16 +121,16 @@
   "scene_topology_sha256": "913d4982dd47aea080c6c8e46da75513c033aadbd699e3bdbffa5ab37c50141a",
   "interactive_studio": {
     "html_file": "cyberpunk_interactive_studio.html",
-    "byte_size": 5978767,
-    "sha256_digest": "50f44974401146222a24a65f69ae67c388708395a31b562492b17a664b9420bc",
+    "byte_size": 5976855,
+    "sha256_digest": "923fdbdfc6516fdd64599797673845788257ddc3178149f6dd0f75a954424077",
     "builder": "build_interactive_studio_html.py",
     "scene_payload": {
       "format": "CPKS",
       "version": 1,
       "raw_bytes": 12177656,
-      "zlib_bytes": 2460597,
-      "base64_chars": 3280796,
-      "sha256": "e22c38f9493773be4b7f7e5b1e2bd4305f57509fed42c3ff28b1669e100a6bcd",
+      "zlib_bytes": 2459162,
+      "base64_chars": 3278884,
+      "sha256": "963a29d11eabce3b18d9c39f1aac2b7fda8107a246fee904c6a949fdbfb360ea",
       "sections": {
         "positions": {
           "bytes": 2860032,
@@ -215,5 +215,5 @@
     "renderer": "WebGL2 / GLSL ES 3.00 multi-target forward pipeline",
     "verified": true
   },
-  "interactive_studio_html_sha256": "50f44974401146222a24a65f69ae67c388708395a31b562492b17a664b9420bc"
+  "interactive_studio_html_sha256": "923fdbdfc6516fdd64599797673845788257ddc3178149f6dd0f75a954424077"
 }

@@ -7,3 +7,7 @@ __pycache__/
 *.wav
 cyberpunk_diorama_viewer.html
 cyberpunk_interactive_studio.html
+*.avi
+*.mp4
+*.rgbz
+_ci_test_*
