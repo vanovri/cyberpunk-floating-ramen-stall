@@ -1,0 +1,22 @@
+name: Blender 4.x Procedural Scene & glTF 2.0 Verification CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  verify-procedural-engine:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Run 32-Track AST & Dual Blender 4.0/4.3 Runtime Verification
+        run: python verify_blender_script.py cyberpunk_floating_ramen_stall.py
