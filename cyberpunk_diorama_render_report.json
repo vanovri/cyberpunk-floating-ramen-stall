@@ -13,9 +13,9 @@
   "workers": 8,
   "render_wall_seconds": 218.6,
   "scene_build_seconds": 26.03,
-  "scene_source_sha256": "a3b854d1dc08ebddab30dafbcbfff3fb6da2b2109c0d4d0a8fbce090b205aad6",
+  "scene_source_sha256": "bb5d83811512dbacd277079c9a9bf875d068e3e12ef4e65141663f843f0f6953",
   "triangles_total": 102944,
-  "geometries": 527,
+  "geometries": 519,
   "director_cut": [
     {
       "frame": 1,
@@ -563,22 +563,22 @@
     },
     "mp4": {
       "path": "C:\\Users\\ardhy\\.gemini\\antigravity\\brain\\8f062548-77e6-47a0-8cdc-0b6553a0f698\\scratch\\phase7\\cyberpunk_diorama_240f.mp4",
-      "bytes": 24160441,
+      "bytes": 24160460,
       "video_samples": 240,
       "audio_pcm_frames": 480000,
       "codec": "avc1 (H.264 Constrained Baseline, I_PCM IDR)",
       "audio_codec": "sowt (PCM s16le 48 kHz stereo)",
-      "sps_hex": "6742c02ada050669a80808320000030002000003006108",
+      "sps_hex": "6742c02ada050669a808080a0000030002000003006108",
       "pps_hex": "68ce3c80",
-      "sha256": "ea4cc2e78ac06f64cc2185dfd81c8bb38dda694e3ef957b7decd2bcd438aa538"
+      "sha256": "b480159fc8b7460eaa2469f0e878e286dc48660f8d3a7804b0a33c21e4b8635f"
     },
     "ffmpeg_h264_aac": {
       "available": true,
       "ok": true,
       "path": "C:\\Users\\ardhy\\.gemini\\antigravity\\brain\\8f062548-77e6-47a0-8cdc-0b6553a0f698\\scratch\\phase7\\cyberpunk_diorama_240f_h264_aac.mp4",
-      "bytes": 1814273,
+      "bytes": 1806392,
       "stderr": "",
-      "sha256": "bba8d8a27bc53f62d7ce84681a5acdd7c94246eece9a064238e625d31c0fba79"
+      "sha256": "7a08bc7b1a67728977a360c5150890a546fdb64b4ada5a6837d9535245bee3fa"
     },
     "fps": 24,
     "frames": 240,

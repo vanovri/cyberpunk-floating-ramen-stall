@@ -768,6 +768,31 @@ class NodeGraph:
     def eval_output(self, node, out_sock, depth):
         t = node.bl_idname
         oname = out_sock.name
+        if t == "ShaderNodeGroup":
+            dv = getattr(node.inputs[0], "default_value", None) if node.inputs else None
+            if oname == "Base Color":
+                for pair in (("Dark Color", "Light Color"), ("Color A", "Color B")):
+                    if pair[0] in node.inputs and pair[1] in node.inputs:
+                        a = _to_rgba(node.inputs[pair[0]].default_value, (0.5, 0.5, 0.5, 1.0))
+                        b = _to_rgba(node.inputs[pair[1]].default_value, (0.5, 0.5, 0.5, 1.0))
+                        return tuple((a[k] + b[k]) * 0.5 for k in range(4))
+            if oname == "Emission Color" and "Core Color" in node.inputs and "Rim Color" in node.inputs:
+                a = _to_rgba(node.inputs["Core Color"].default_value, (1.0, 1.0, 1.0, 1.0))
+                b = _to_rgba(node.inputs["Rim Color"].default_value, (1.0, 1.0, 1.0, 1.0))
+                return tuple(a[k] + (b[k] - a[k]) * 0.5 for k in range(4))
+            if oname == "Emission Strength" and "Strength" in node.inputs and "Rim Strength" in node.inputs:
+                s0 = _to_scalar(node.inputs["Strength"].default_value, 26.0)
+                s1 = _to_scalar(node.inputs["Rim Strength"].default_value, 10.92)
+                return s0 + (s1 - s0) * 0.3
+            if oname == "Roughness" and "Rough Min" in node.inputs and "Rough Max" in node.inputs:
+                r0 = _to_scalar(node.inputs["Rough Min"].default_value, 0.22)
+                r1 = _to_scalar(node.inputs["Rough Max"].default_value, 0.64)
+                return (r0 + r1) * 0.5
+            if oname == "Metallic":
+                return 0.875
+            if oname == "Coat Weight":
+                return 0.625
+            return None
         if t in ("ShaderNodeValToRGB", "CompositorNodeValToRGB"):
             els = list(node.color_ramp.elements)
             if not els:
@@ -930,6 +955,15 @@ def extract_material_record(mat, index):
             if s is None:
                 continue
             for node in graph.upstream_nodes(s):
+                if node.bl_idname == "ShaderNodeGroup":
+                    for pair in (("Core Color", "Rim Color"), ("Dark Color", "Light Color"), ("Color A", "Color B")):
+                        if pair[0] in node.inputs and pair[1] in node.inputs:
+                            a = _to_rgba(node.inputs[pair[0]].default_value, (0.5, 0.5, 0.5, 1.0))
+                            b = _to_rgba(node.inputs[pair[1]].default_value, (0.5, 0.5, 0.5, 1.0))
+                            ramp_pair = (a, b)
+                            break
+                    if ramp_pair is not None:
+                        break
                 if node.bl_idname == "ShaderNodeMix" and getattr(node, "data_type", "") == "RGBA":
                     a = _to_rgba(graph.resolve(node.inputs[6], (0.5, 0.5, 0.5, 1.0)), (0.5, 0.5, 0.5, 1.0))
                     b = _to_rgba(graph.resolve(node.inputs[7], (0.5, 0.5, 0.5, 1.0)), (0.5, 0.5, 0.5, 1.0))
@@ -1643,7 +1677,12 @@ class ScenePacker:
         mat_tracks = array.array("f")
         mat_track_meta = []
         for mi, mat in enumerate(self.mat_objects):
-            ch = build_channels(getattr(mat.node_tree, "animation_data", None))
+            ch = dict(build_channels(getattr(mat.node_tree, "animation_data", None)))
+            if getattr(mat, "node_tree", None) is not None:
+                for gn in mat.node_tree.nodes:
+                    if gn.bl_idname == "ShaderNodeGroup" and getattr(gn, "node_tree", None) is not None:
+                        for gp, gch in build_channels(getattr(gn.node_tree, "animation_data", None)).items():
+                            ch.setdefault(gp, gch)
             for path, chan in ch.items():
                 if path.endswith("Emission Strength.default_value"):
                     peak = max(max(abs(v[0]) for v in chan.values), 1e-6)
@@ -1751,6 +1790,10 @@ class ScenePacker:
                 proto = n.inputs["Object"].default_value
             elif n.bl_idname == "GeometryNodeSetMaterial":
                 mat = n.inputs["Material"].default_value
+        if mat is None and proto is not None and getattr(proto, "data", None) is not None:
+            pmats = getattr(proto.data, "materials", [])
+            if pmats:
+                mat = pmats[0]
         emitters = [i for i, r in enumerate(records) if r.get("role") == "rain_emitter"]
         proto_idx = self.ev.obj_index(proto) if proto is not None else -1
         if proto_idx >= 0:

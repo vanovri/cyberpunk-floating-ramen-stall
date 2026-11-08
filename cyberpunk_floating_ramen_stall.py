@@ -129,7 +129,21 @@ def configure_render_and_world(scene):
     scene.cycles.samples = 4096
     scene.cycles.preview_samples = 128
     scene.cycles.use_adaptive_sampling = True
-    scene.cycles.adaptive_threshold = 0.005
+    scene.cycles.adaptive_threshold = 0.008
+    if hasattr(scene.cycles, "adaptive_min_samples"):
+        scene.cycles.adaptive_min_samples = 128
+    if hasattr(scene.cycles, "sample_clamp_direct"):
+        scene.cycles.sample_clamp_direct = 10.0
+    if hasattr(scene.cycles, "sample_clamp_indirect"):
+        scene.cycles.sample_clamp_indirect = 3.5
+    if hasattr(scene.cycles, "blur_glossy"):
+        scene.cycles.blur_glossy = 0.18
+    if hasattr(scene.cycles, "use_light_tree"):
+        scene.cycles.use_light_tree = True
+    if hasattr(scene.cycles, "seed"):
+        scene.cycles.seed = 2099
+    if hasattr(scene.cycles, "use_animated_seed"):
+        scene.cycles.use_animated_seed = False
     scene.cycles.use_denoising = True
     scene.cycles.denoiser = 'OPENIMAGEDENOISE'
     if hasattr(scene.cycles, "denoising_input_passes"):
@@ -138,14 +152,14 @@ def configure_render_and_world(scene):
         scene.cycles.denoising_prefilter = 'ACCURATE'
     scene.cycles.use_preview_denoising = True
 
-    # Light path & volumetric integration settings
+    # Light path & volumetric integration settings (anti-firefly single-scatter volume)
     scene.cycles.max_bounces = 12
     scene.cycles.diffuse_bounces = 4
     scene.cycles.glossy_bounces = 6
     scene.cycles.transmission_bounces = 8
-    scene.cycles.volume_bounces = 2
+    scene.cycles.volume_bounces = 0
     scene.cycles.transparent_max_bounces = 8
-    scene.cycles.volume_step_rate = 0.5
+    scene.cycles.volume_step_rate = 0.65
     scene.cycles.volume_max_steps = 256
 
     # AgX Color Management with High Contrast (compatible with Blender 4.0 and 4.2+ OCIO names)
@@ -242,6 +256,182 @@ def init_material(name):
     return mat, mat.node_tree
 
 
+def _get_or_create_brushed_metal_core_group():
+    """Shared ShaderNodeGroup NG_Brushed_Metal_Core for weathered anisotropic metals."""
+    grp = bpy.data.node_groups.get("NG_Brushed_Metal_Core")
+    if grp is not None:
+        return grp
+    grp = bpy.data.node_groups.new(name="NG_Brushed_Metal_Core", type='ShaderNodeTree')
+    for s_name, s_type in (
+        ("Brush Stretch", 'NodeSocketVector'),
+        ("Dark Color", 'NodeSocketColor'),
+        ("Light Color", 'NodeSocketColor'),
+        ("Rough Min", 'NodeSocketFloat'),
+        ("Rough Max", 'NodeSocketFloat'),
+        ("Bump Strength", 'NodeSocketFloat'),
+    ):
+        grp.interface.new_socket(name=s_name, in_out='INPUT', socket_type=s_type)
+    for s_name, s_type in (
+        ("Base Color", 'NodeSocketColor'),
+        ("Metallic", 'NodeSocketFloat'),
+        ("Roughness", 'NodeSocketFloat'),
+        ("Normal", 'NodeSocketVector'),
+    ):
+        grp.interface.new_socket(name=s_name, in_out='OUTPUT', socket_type=s_type)
+
+    g_in = spawn_node(grp, "NodeGroupInput", -1180, 0, "Metal Parameters")
+    tex_coord = spawn_node(grp, "ShaderNodeTexCoord", -980, 120, "Object Coords")
+    mapping = spawn_node(grp, "ShaderNodeMapping", -780, 120, "Anisotropic Brush Stretch")
+
+    noise = spawn_node(grp, "ShaderNodeTexNoise", -560, 120, "Brush Streak Noise")
+    noise.inputs["Scale"].default_value = 14.0
+    noise.inputs["Detail"].default_value = 4.5
+    noise.inputs["Roughness"].default_value = 0.65
+    noise.inputs["Distortion"].default_value = 0.35
+
+    voronoi = spawn_node(grp, "ShaderNodeTexVoronoi", -340, 120, "Oxidation Grain Voronoi")
+    voronoi.feature = 'F1'
+    voronoi.distance = 'EUCLIDEAN'
+    voronoi.inputs["Scale"].default_value = 22.0
+    voronoi.inputs["Randomness"].default_value = 0.85
+
+    color_mix = spawn_node(grp, "ShaderNodeMix", -80, 260, "Albedo Patina Mix")
+    color_mix.data_type = 'RGBA'
+    color_mix.blend_type = 'MIX'
+
+    metal_ramp = spawn_node(grp, "ShaderNodeValToRGB", -80, 40, "Metallic Wear Ramp")
+    metal_ramp.color_ramp.elements[0].position = 0.12
+    metal_ramp.color_ramp.elements[0].color = (0.76, 0.76, 0.76, 1.0)
+    metal_ramp.color_ramp.elements[1].position = 0.65
+    metal_ramp.color_ramp.elements[1].color = (0.99, 0.99, 0.99, 1.0)
+
+    rough_mix = spawn_node(grp, "ShaderNodeMix", -80, -160, "Roughness Scuff Mix")
+    rough_mix.data_type = 'FLOAT'
+
+    bump = spawn_node(grp, "ShaderNodeBump", 160, -240, "Brushed Micro-Groove Bump")
+    bump.inputs["Distance"].default_value = 0.004
+
+    g_out = spawn_node(grp, "NodeGroupOutput", 420, 80, "Metal Core Output")
+
+    link_nodes(grp, tex_coord, "Object", mapping, "Vector")
+    link_nodes(grp, g_in, "Brush Stretch", mapping, "Scale")
+    link_nodes(grp, mapping, "Vector", noise, "Vector")
+    link_nodes(grp, noise, "Color", voronoi, "Vector")
+    link_nodes(grp, voronoi, "Distance", color_mix, 0)
+    link_nodes(grp, g_in, "Dark Color", color_mix, 6)
+    link_nodes(grp, g_in, "Light Color", color_mix, 7)
+    link_nodes(grp, voronoi, "Distance", metal_ramp, "Fac")
+    link_nodes(grp, voronoi, "Distance", rough_mix, 0)
+    link_nodes(grp, g_in, "Rough Min", rough_mix, 2)
+    link_nodes(grp, g_in, "Rough Max", rough_mix, 3)
+    link_nodes(grp, g_in, "Bump Strength", bump, "Strength")
+    link_nodes(grp, noise, "Fac", bump, "Height")
+
+    link_nodes(grp, color_mix, 2, g_out, "Base Color")
+    link_nodes(grp, metal_ramp, "Color", g_out, "Metallic")
+    link_nodes(grp, rough_mix, 0, g_out, "Roughness")
+    link_nodes(grp, bump, "Normal", g_out, "Normal")
+    return grp
+
+
+def _get_or_create_cyber_neon_tube_group():
+    """Shared ShaderNodeGroup NG_Cyber_Neon_Tube for Fresnel neon plasma glass tubes."""
+    grp = bpy.data.node_groups.get("NG_Cyber_Neon_Tube")
+    if grp is not None:
+        return grp
+    grp = bpy.data.node_groups.new(name="NG_Cyber_Neon_Tube", type='ShaderNodeTree')
+    for s_name, s_type in (
+        ("Core Color", 'NodeSocketColor'),
+        ("Rim Color", 'NodeSocketColor'),
+        ("Strength", 'NodeSocketFloat'),
+        ("Rim Strength", 'NodeSocketFloat'),
+    ):
+        grp.interface.new_socket(name=s_name, in_out='INPUT', socket_type=s_type)
+    for s_name, s_type in (
+        ("Emission Color", 'NodeSocketColor'),
+        ("Emission Strength", 'NodeSocketFloat'),
+    ):
+        grp.interface.new_socket(name=s_name, in_out='OUTPUT', socket_type=s_type)
+
+    g_in = spawn_node(grp, "NodeGroupInput", -760, 40, "Neon Parameters")
+    fresnel = spawn_node(grp, "ShaderNodeFresnel", -540, 180, "Tube Glass Fresnel")
+    fresnel.inputs["IOR"].default_value = 1.58
+
+    layer_weight = spawn_node(grp, "ShaderNodeLayerWeight", -540, 0, "Plasma Core Facing")
+    layer_weight.inputs["Blend"].default_value = 0.38
+
+    falloff_ramp = spawn_node(grp, "ShaderNodeValToRGB", -300, 80, "Fresnel Falloff Curve")
+    falloff_ramp.color_ramp.interpolation = 'EASE'
+    falloff_ramp.color_ramp.elements[0].position = 0.08
+    falloff_ramp.color_ramp.elements[0].color = (0.0, 0.0, 0.0, 1.0)
+    falloff_ramp.color_ramp.elements[1].position = 0.78
+    falloff_ramp.color_ramp.elements[1].color = (1.0, 1.0, 1.0, 1.0)
+
+    color_mix = spawn_node(grp, "ShaderNodeMix", -40, 180, "Hot Core to Neon Rim")
+    color_mix.data_type = 'RGBA'
+
+    strength_mix = spawn_node(grp, "ShaderNodeMix", -40, -40, "Fresnel Strength Falloff")
+    strength_mix.data_type = 'FLOAT'
+
+    g_out = spawn_node(grp, "NodeGroupOutput", 240, 80, "Neon Output")
+
+    link_nodes(grp, layer_weight, "Fresnel", falloff_ramp, "Fac")
+    link_nodes(grp, falloff_ramp, "Color", color_mix, 0)
+    link_nodes(grp, g_in, "Core Color", color_mix, 6)
+    link_nodes(grp, g_in, "Rim Color", color_mix, 7)
+    link_nodes(grp, fresnel, "Fac", strength_mix, 0)
+    link_nodes(grp, g_in, "Strength", strength_mix, 2)
+    link_nodes(grp, g_in, "Rim Strength", strength_mix, 3)
+    link_nodes(grp, color_mix, 2, g_out, "Emission Color")
+    link_nodes(grp, strength_mix, 0, g_out, "Emission Strength")
+    return grp
+
+
+def _get_or_create_triplanar_ramp_bump_group():
+    """Shared ShaderNodeGroup NG_Triplanar_Ramp_Bump for stained timber and ceramic glazes."""
+    grp = bpy.data.node_groups.get("NG_Triplanar_Ramp_Bump")
+    if grp is not None:
+        return grp
+    grp = bpy.data.node_groups.new(name="NG_Triplanar_Ramp_Bump", type='ShaderNodeTree')
+    for s_name, s_type in (
+        ("Fac", 'NodeSocketFloat'),
+        ("Color A", 'NodeSocketColor'),
+        ("Color B", 'NodeSocketColor'),
+        ("Bump Strength", 'NodeSocketFloat'),
+        ("Bump Distance", 'NodeSocketFloat'),
+    ):
+        grp.interface.new_socket(name=s_name, in_out='INPUT', socket_type=s_type)
+    for s_name, s_type in (
+        ("Base Color", 'NodeSocketColor'),
+        ("Normal", 'NodeSocketVector'),
+    ):
+        grp.interface.new_socket(name=s_name, in_out='OUTPUT', socket_type=s_type)
+
+    g_in = spawn_node(grp, "NodeGroupInput", -540, 0, "Surface Parameters")
+    ramp = spawn_node(grp, "ShaderNodeValToRGB", -280, 140, "Surface Contrast Curve")
+    ramp.color_ramp.elements[0].position = 0.22
+    ramp.color_ramp.elements[0].color = (0.0, 0.0, 0.0, 1.0)
+    ramp.color_ramp.elements[1].position = 0.78
+    ramp.color_ramp.elements[1].color = (1.0, 1.0, 1.0, 1.0)
+
+    col_mix = spawn_node(grp, "ShaderNodeMix", -20, 140, "Dual Tone Albedo Mix")
+    col_mix.data_type = 'RGBA'
+
+    bump = spawn_node(grp, "ShaderNodeBump", -20, -100, "Surface Relief Bump")
+    g_out = spawn_node(grp, "NodeGroupOutput", 240, 40, "Surface Output")
+
+    link_nodes(grp, g_in, "Fac", ramp, "Fac")
+    link_nodes(grp, ramp, "Color", col_mix, 0)
+    link_nodes(grp, g_in, "Color A", col_mix, 6)
+    link_nodes(grp, g_in, "Color B", col_mix, 7)
+    link_nodes(grp, g_in, "Bump Strength", bump, "Strength")
+    link_nodes(grp, g_in, "Bump Distance", bump, "Distance")
+    link_nodes(grp, g_in, "Fac", bump, "Height")
+    link_nodes(grp, col_mix, 2, g_out, "Base Color")
+    link_nodes(grp, bump, "Normal", g_out, "Normal")
+    return grp
+
+
 def build_weathered_brushed_metal_shader(
     name,
     dark_color,
@@ -251,66 +441,33 @@ def build_weathered_brushed_metal_shader(
     rough_max=0.64,
     bump_strength=0.14,
 ):
-    """Weathered Brushed Metal: Noise -> Voronoi -> ColorRamp -> Metallic & Roughness + Bump."""
+    """Weathered Brushed Metal via shared NG_Brushed_Metal_Core ShaderNodeGroup."""
     mat, nt = init_material(name)
+    core_grp = _get_or_create_brushed_metal_core_group()
 
-    tex_coord = spawn_node(nt, "ShaderNodeTexCoord", -1120, 0, "Object Coords")
-    mapping = spawn_node(nt, "ShaderNodeMapping", -920, 0, "Anisotropic Brush Stretch")
-    mapping.inputs["Scale"].default_value = brush_stretch
+    grp_node = spawn_node(nt, "ShaderNodeGroup", -240, 80, "Brushed Metal Core")
+    grp_node.node_tree = core_grp
+    grp_node.inputs["Brush Stretch"].default_value = brush_stretch
+    grp_node.inputs["Dark Color"].default_value = dark_color
+    grp_node.inputs["Light Color"].default_value = light_color
+    grp_node.inputs["Rough Min"].default_value = rough_min
+    grp_node.inputs["Rough Max"].default_value = rough_max
+    grp_node.inputs["Bump Strength"].default_value = bump_strength
 
-    noise = spawn_node(nt, "ShaderNodeTexNoise", -700, 80, "Brush Streak Noise")
-    noise.inputs["Scale"].default_value = 14.0
-    noise.inputs["Detail"].default_value = 8.0
-    noise.inputs["Roughness"].default_value = 0.65
-    noise.inputs["Distortion"].default_value = 0.35
-
-    voronoi = spawn_node(nt, "ShaderNodeTexVoronoi", -480, 80, "Oxidation Grain Voronoi")
-    voronoi.feature = 'F1'
-    voronoi.distance = 'EUCLIDEAN'
-    voronoi.inputs["Scale"].default_value = 22.0
-    voronoi.inputs["Randomness"].default_value = 0.85
-
-    color_ramp = spawn_node(nt, "ShaderNodeValToRGB", -240, 260, "Albedo Patina Ramp")
-    color_ramp.color_ramp.interpolation = 'LINEAR'
-    color_ramp.color_ramp.elements[0].position = 0.18
-    color_ramp.color_ramp.elements[0].color = dark_color
-    color_ramp.color_ramp.elements[1].position = 0.82
-    color_ramp.color_ramp.elements[1].color = light_color
-
-    metal_ramp = spawn_node(nt, "ShaderNodeValToRGB", -240, 40, "Metallic Wear Ramp")
-    metal_ramp.color_ramp.elements[0].position = 0.12
-    metal_ramp.color_ramp.elements[0].color = (0.76, 0.76, 0.76, 1.0)
-    metal_ramp.color_ramp.elements[1].position = 0.65
-    metal_ramp.color_ramp.elements[1].color = (0.99, 0.99, 0.99, 1.0)
-
-    rough_ramp = spawn_node(nt, "ShaderNodeValToRGB", -240, -180, "Roughness Scuff Ramp")
-    rough_ramp.color_ramp.elements[0].position = 0.20
-    rough_ramp.color_ramp.elements[0].color = (rough_min, rough_min, rough_min, 1.0)
-    rough_ramp.color_ramp.elements[1].position = 0.85
-    rough_ramp.color_ramp.elements[1].color = (rough_max, rough_max, rough_max, 1.0)
-
-    bump = spawn_node(nt, "ShaderNodeBump", 40, -240, "Brushed Micro-Groove Bump")
-    bump.inputs["Strength"].default_value = bump_strength
-    bump.inputs["Distance"].default_value = 0.004
-
+    avg_col = tuple((dark_color[k] + light_color[k]) * 0.5 for k in range(3)) + (1.0,)
     bsdf = spawn_node(nt, "ShaderNodeBsdfPrincipled", 300, 80, "Principled Brushed Metal")
+    bsdf.inputs["Base Color"].default_value = avg_col
+    bsdf.inputs["Metallic"].default_value = 0.875
+    bsdf.inputs["Roughness"].default_value = (rough_min + rough_max) * 0.5
     bsdf.inputs["Coat Weight"].default_value = 0.18
     bsdf.inputs["Coat Roughness"].default_value = 0.28
 
     out = spawn_node(nt, "ShaderNodeOutputMaterial", 600, 80, "Material Output")
 
-    link_nodes(nt, tex_coord, "Object", mapping, "Vector")
-    link_nodes(nt, mapping, "Vector", noise, "Vector")
-    link_nodes(nt, noise, "Color", voronoi, "Vector")
-    link_nodes(nt, voronoi, "Distance", color_ramp, "Fac")
-    link_nodes(nt, voronoi, "Distance", metal_ramp, "Fac")
-    link_nodes(nt, voronoi, "Distance", rough_ramp, "Fac")
-    link_nodes(nt, noise, "Fac", bump, "Height")
-
-    link_nodes(nt, color_ramp, "Color", bsdf, "Base Color")
-    link_nodes(nt, metal_ramp, "Color", bsdf, "Metallic")
-    link_nodes(nt, rough_ramp, "Color", bsdf, "Roughness")
-    link_nodes(nt, bump, "Normal", bsdf, "Normal")
+    link_nodes(nt, grp_node, "Base Color", bsdf, "Base Color")
+    link_nodes(nt, grp_node, "Metallic", bsdf, "Metallic")
+    link_nodes(nt, grp_node, "Roughness", bsdf, "Roughness")
+    link_nodes(nt, grp_node, "Normal", bsdf, "Normal")
     link_nodes(nt, bsdf, "BSDF", out, "Surface")
     return mat
 
@@ -328,7 +485,7 @@ def build_wet_asphalt_concrete_shader(name):
         macro_tex = spawn_node(nt, "ShaderNodeTexMusgrave", -780, 220, "Musgrave Puddle Basin")
         macro_tex.musgrave_type = 'HYBRID_MULTIFRACTAL'
         macro_tex.inputs["Scale"].default_value = 1.35
-        macro_tex.inputs["Detail"].default_value = 6.0
+        macro_tex.inputs["Detail"].default_value = 4.5
         macro_tex.inputs["Dimension"].default_value = 0.7
         macro_tex.inputs["Lacunarity"].default_value = 2.1
     else:
@@ -336,7 +493,7 @@ def build_wet_asphalt_concrete_shader(name):
         macro_tex.noise_type = 'HYBRID_MULTIFRACTAL'
         macro_tex.normalize = True
         macro_tex.inputs["Scale"].default_value = 1.35
-        macro_tex.inputs["Detail"].default_value = 6.0
+        macro_tex.inputs["Detail"].default_value = 4.5
         macro_tex.inputs["Roughness"].default_value = 0.58
         macro_tex.inputs["Lacunarity"].default_value = 2.1
 
@@ -349,7 +506,7 @@ def build_wet_asphalt_concrete_shader(name):
 
     stone_noise = spawn_node(nt, "ShaderNodeTexNoise", -780, -120, "Aggregate Grit")
     stone_noise.inputs["Scale"].default_value = 42.0
-    stone_noise.inputs["Detail"].default_value = 10.0
+    stone_noise.inputs["Detail"].default_value = 4.5
     stone_noise.inputs["Roughness"].default_value = 0.72
 
     stone_voronoi = spawn_node(nt, "ShaderNodeTexVoronoi", -780, -340, "Pebble Chippings")
@@ -430,45 +587,30 @@ def build_wet_asphalt_concrete_shader(name):
 
 
 def build_cyber_neon_shader(name, core_rgba, rim_rgba, strength=26.0):
-    """Cyber Neon Emission Shader with Fresnel falloff & glass tube coat."""
+    """Cyber Neon Emission Shader via shared NG_Cyber_Neon_Tube ShaderNodeGroup."""
     mat, nt = init_material(name)
+    neon_grp = _get_or_create_cyber_neon_tube_group()
 
-    fresnel = spawn_node(nt, "ShaderNodeFresnel", -560, 180, "Tube Glass Fresnel")
-    fresnel.inputs["IOR"].default_value = 1.58
+    grp_node = spawn_node(nt, "ShaderNodeGroup", -120, 100, "Cyber Neon Tube Core")
+    grp_node.node_tree = neon_grp
+    grp_node.inputs["Core Color"].default_value = core_rgba
+    grp_node.inputs["Rim Color"].default_value = rim_rgba
+    grp_node.inputs["Strength"].default_value = strength
+    grp_node.inputs["Rim Strength"].default_value = strength * 0.42
 
-    layer_weight = spawn_node(nt, "ShaderNodeLayerWeight", -560, 0, "Plasma Core Facing")
-    layer_weight.inputs["Blend"].default_value = 0.38
-
-    falloff_ramp = spawn_node(nt, "ShaderNodeValToRGB", -320, 80, "Fresnel Falloff Curve")
-    falloff_ramp.color_ramp.interpolation = 'EASE'
-    falloff_ramp.color_ramp.elements[0].position = 0.08
-    falloff_ramp.color_ramp.elements[0].color = (0.0, 0.0, 0.0, 1.0)
-    falloff_ramp.color_ramp.elements[1].position = 0.78
-    falloff_ramp.color_ramp.elements[1].color = (1.0, 1.0, 1.0, 1.0)
-
-    color_mix = spawn_node(nt, "ShaderNodeMix", -60, 180, "Hot Core to Neon Rim")
-    color_mix.data_type = 'RGBA'
-    color_mix.inputs[6].default_value = core_rgba
-    color_mix.inputs[7].default_value = rim_rgba
-
-    strength_mix = spawn_node(nt, "ShaderNodeMix", -60, -40, "Fresnel Strength Falloff")
-    strength_mix.data_type = 'FLOAT'
-    strength_mix.inputs[2].default_value = strength
-    strength_mix.inputs[3].default_value = strength * 0.42
-
+    mid_emit = tuple((core_rgba[k] + rim_rgba[k]) * 0.5 for k in range(3)) + (1.0,)
     bsdf = spawn_node(nt, "ShaderNodeBsdfPrincipled", 220, 100, "Principled Neon Tube")
     bsdf.inputs["Base Color"].default_value = rim_rgba
     bsdf.inputs["Roughness"].default_value = 0.06
     bsdf.inputs["Coat Weight"].default_value = 1.0
     bsdf.inputs["Coat Roughness"].default_value = 0.02
+    bsdf.inputs["Emission Color"].default_value = mid_emit
+    bsdf.inputs["Emission Strength"].default_value = strength * 0.71
 
     out = spawn_node(nt, "ShaderNodeOutputMaterial", 520, 100, "Material Output")
 
-    link_nodes(nt, layer_weight, "Fresnel", falloff_ramp, "Fac")
-    link_nodes(nt, falloff_ramp, "Color", color_mix, 0)
-    link_nodes(nt, fresnel, "Fac", strength_mix, 0)
-    link_nodes(nt, color_mix, 2, bsdf, "Emission Color")
-    link_nodes(nt, strength_mix, 0, bsdf, "Emission Strength")
+    link_nodes(nt, grp_node, "Emission Color", bsdf, "Emission Color")
+    link_nodes(nt, grp_node, "Emission Strength", bsdf, "Emission Strength")
     link_nodes(nt, bsdf, "BSDF", out, "Surface")
     return mat
 
@@ -490,7 +632,7 @@ def build_translucent_paper_lantern_shader(name):
 
     fiber_noise = spawn_node(nt, "ShaderNodeTexNoise", -500, -60, "Mulberry Washi Fibers")
     fiber_noise.inputs["Scale"].default_value = 46.0
-    fiber_noise.inputs["Detail"].default_value = 8.0
+    fiber_noise.inputs["Detail"].default_value = 4.5
     fiber_noise.inputs["Roughness"].default_value = 0.7
 
     paper_ramp = spawn_node(nt, "ShaderNodeValToRGB", -240, 140, "Warm Vermilion Washi")
@@ -536,8 +678,9 @@ def build_translucent_paper_lantern_shader(name):
 
 
 def build_procedural_wood_shader(name, grain_dark, grain_light, coat_weight=0.35, roughness=0.42):
-    """Procedural Japanese Timber Shader (Charred Cedar & Oiled Hinoki Counter)."""
+    """Procedural Japanese Timber Shader using shared NG_Triplanar_Ramp_Bump."""
     mat, nt = init_material(name)
+    surf_grp = _get_or_create_triplanar_ramp_bump_group()
 
     tex_coord = spawn_node(nt, "ShaderNodeTexCoord", -900, 0, "Wood Coords")
     mapping = spawn_node(nt, "ShaderNodeMapping", -700, 0, "Wood Grain Stretch")
@@ -547,19 +690,18 @@ def build_procedural_wood_shader(name, grain_dark, grain_light, coat_weight=0.35
     wave.wave_type = 'RINGS'
     wave.inputs["Scale"].default_value = 6.5
     wave.inputs["Distortion"].default_value = 5.2
-    wave.inputs["Detail"].default_value = 6.0
+    wave.inputs["Detail"].default_value = 4.5
 
-    ramp = spawn_node(nt, "ShaderNodeValToRGB", -220, 140, "Timber Stain Ramp")
-    ramp.color_ramp.elements[0].position = 0.22
-    ramp.color_ramp.elements[0].color = grain_dark
-    ramp.color_ramp.elements[1].position = 0.78
-    ramp.color_ramp.elements[1].color = grain_light
+    grp_node = spawn_node(nt, "ShaderNodeGroup", -200, 80, "Timber Ramp & Relief")
+    grp_node.node_tree = surf_grp
+    grp_node.inputs["Color A"].default_value = grain_dark
+    grp_node.inputs["Color B"].default_value = grain_light
+    grp_node.inputs["Bump Strength"].default_value = 0.16
+    grp_node.inputs["Bump Distance"].default_value = 0.004
 
-    bump = spawn_node(nt, "ShaderNodeBump", -180, -100, "Wood Grain Relief")
-    bump.inputs["Strength"].default_value = 0.16
-    bump.inputs["Distance"].default_value = 0.004
-
+    avg_col = tuple((grain_dark[k] + grain_light[k]) * 0.5 for k in range(3)) + (1.0,)
     bsdf = spawn_node(nt, "ShaderNodeBsdfPrincipled", 120, 80, "Principled Timber")
+    bsdf.inputs["Base Color"].default_value = avg_col
     bsdf.inputs["Roughness"].default_value = roughness
     bsdf.inputs["Coat Weight"].default_value = coat_weight
     bsdf.inputs["Coat Roughness"].default_value = 0.14
@@ -568,34 +710,33 @@ def build_procedural_wood_shader(name, grain_dark, grain_light, coat_weight=0.35
 
     link_nodes(nt, tex_coord, "Object", mapping, "Vector")
     link_nodes(nt, mapping, "Vector", wave, "Vector")
-    link_nodes(nt, wave, "Fac", ramp, "Fac")
-    link_nodes(nt, wave, "Fac", bump, "Height")
-    link_nodes(nt, ramp, "Color", bsdf, "Base Color")
-    link_nodes(nt, bump, "Normal", bsdf, "Normal")
+    link_nodes(nt, wave, "Fac", grp_node, "Fac")
+    link_nodes(nt, grp_node, "Base Color", bsdf, "Base Color")
+    link_nodes(nt, grp_node, "Normal", bsdf, "Normal")
     link_nodes(nt, bsdf, "BSDF", out, "Surface")
     return mat
 
 
 def build_glazed_ceramic_shader(name, base_col, accent_col, roughness=0.14, coat=0.90):
-    """Glazed Ceramic Shader for Roof Kawara Tiles and Stoneware Ramen Bowls."""
+    """Glazed Ceramic Shader using shared NG_Triplanar_Ramp_Bump."""
     mat, nt = init_material(name)
+    surf_grp = _get_or_create_triplanar_ramp_bump_group()
 
     tex_coord = spawn_node(nt, "ShaderNodeTexCoord", -780, 0, "Ceramic Coords")
     noise = spawn_node(nt, "ShaderNodeTexNoise", -560, 60, "Kiln Glaze Speckle")
     noise.inputs["Scale"].default_value = 18.0
-    noise.inputs["Detail"].default_value = 5.0
+    noise.inputs["Detail"].default_value = 4.5
 
-    ramp = spawn_node(nt, "ShaderNodeValToRGB", -300, 100, "Glaze Variation")
-    ramp.color_ramp.elements[0].position = 0.25
-    ramp.color_ramp.elements[0].color = base_col
-    ramp.color_ramp.elements[1].position = 0.80
-    ramp.color_ramp.elements[1].color = accent_col
+    grp_node = spawn_node(nt, "ShaderNodeGroup", -280, 60, "Ceramic Glaze & Dimple")
+    grp_node.node_tree = surf_grp
+    grp_node.inputs["Color A"].default_value = base_col
+    grp_node.inputs["Color B"].default_value = accent_col
+    grp_node.inputs["Bump Strength"].default_value = 0.06
+    grp_node.inputs["Bump Distance"].default_value = 0.002
 
-    bump = spawn_node(nt, "ShaderNodeBump", -260, -120, "Ceramic Micro-Dimple")
-    bump.inputs["Strength"].default_value = 0.06
-    bump.inputs["Distance"].default_value = 0.002
-
+    avg_col = tuple((base_col[k] + accent_col[k]) * 0.5 for k in range(3)) + (1.0,)
     bsdf = spawn_node(nt, "ShaderNodeBsdfPrincipled", 40, 60, "Principled Glazed Ceramic")
+    bsdf.inputs["Base Color"].default_value = avg_col
     bsdf.inputs["Roughness"].default_value = roughness
     bsdf.inputs["Coat Weight"].default_value = coat
     bsdf.inputs["Coat Roughness"].default_value = 0.04
@@ -603,10 +744,9 @@ def build_glazed_ceramic_shader(name, base_col, accent_col, roughness=0.14, coat
     out = spawn_node(nt, "ShaderNodeOutputMaterial", 340, 60, "Material Output")
 
     link_nodes(nt, tex_coord, "Object", noise, "Vector")
-    link_nodes(nt, noise, "Fac", ramp, "Fac")
-    link_nodes(nt, noise, "Fac", bump, "Height")
-    link_nodes(nt, ramp, "Color", bsdf, "Base Color")
-    link_nodes(nt, bump, "Normal", bsdf, "Normal")
+    link_nodes(nt, noise, "Fac", grp_node, "Fac")
+    link_nodes(nt, grp_node, "Base Color", bsdf, "Base Color")
+    link_nodes(nt, grp_node, "Normal", bsdf, "Normal")
     link_nodes(nt, bsdf, "BSDF", out, "Surface")
     return mat
 
@@ -1943,7 +2083,7 @@ def register_shader_aov_outputs(view_layer, mats):
 
 
 def build_compositor_post_processing(scene):
-    """Build multi-stage Blender 4.x Cycles Compositor graph with Mist, AO, Dual Glare & Grading."""
+    """Build multi-stage Blender 4.x Cycles Compositor graph with Denoise, Despeckle, Mist, AO, Dual Glare & Grading."""
     view_layer = bpy.context.view_layer
     for attr_name in (
         "use_pass_mist",
@@ -1958,6 +2098,7 @@ def build_compositor_post_processing(scene):
         "use_pass_environment",
         "use_pass_cryptomatte_object",
         "use_pass_cryptomatte_material",
+        "use_pass_denoising_data",
     ):
         if hasattr(view_layer, attr_name):
             setattr(view_layer, attr_name, True)
@@ -1975,20 +2116,39 @@ def build_compositor_post_processing(scene):
     ctree = scene.node_tree
     ctree.nodes.clear()
 
-    rlayers = spawn_node(ctree, "CompositorNodeRLayers", -1100, 120, "Render Channels")
+    rlayers = spawn_node(ctree, "CompositorNodeRLayers", -1380, 120, "Render Channels")
+
+    # Stage 0: OIDN Albedo/Normal-Guided Denoise + Anti-Firefly Despeckle before Glare
+    denoise_node = spawn_node(ctree, "CompositorNodeDenoise", -1140, 180, "OIDN Aux Denoise")
+    if hasattr(denoise_node, "use_hdr"):
+        denoise_node.use_hdr = True
+    if hasattr(denoise_node, "prefilter"):
+        denoise_node.prefilter = 'ACCURATE'
+    link_nodes(ctree, rlayers, "Image", denoise_node, "Image")
+    if "Normal" in rlayers.outputs and "Normal" in denoise_node.inputs:
+        link_nodes(ctree, rlayers, "Normal", denoise_node, "Normal")
+    if "DiffCol" in rlayers.outputs and "Albedo" in denoise_node.inputs:
+        link_nodes(ctree, rlayers, "DiffCol", denoise_node, "Albedo")
+
+    despeckle_node = spawn_node(ctree, "CompositorNodeDespeckle", -960, 180, "Firefly Suppressor")
+    if hasattr(despeckle_node, "threshold"):
+        despeckle_node.threshold = 0.08
+    if hasattr(despeckle_node, "threshold_neighbor"):
+        despeckle_node.threshold_neighbor = 0.12
+    link_nodes(ctree, denoise_node, "Image", despeckle_node, "Image")
 
     # Stage 1: Ambient Occlusion contact-shadow micro-contrast multiplication
-    ao_mix = spawn_node(ctree, "CompositorNodeMixRGB", -800, 180, "AO Contact Multiply")
+    ao_mix = spawn_node(ctree, "CompositorNodeMixRGB", -760, 180, "AO Contact Multiply")
     ao_mix.blend_type = 'MULTIPLY'
     ao_mix.inputs[0].default_value = 0.24
-    link_nodes(ctree, rlayers, "Image", ao_mix, 1)
+    link_nodes(ctree, despeckle_node, "Image", ao_mix, 1)
     if "AO" in rlayers.outputs:
         link_nodes(ctree, rlayers, "AO", ao_mix, 2)
     else:
         ao_mix.inputs[2].default_value = (1.0, 1.0, 1.0, 1.0)
 
     # Stage 2: Emission-reinforced Dual Glare (Atmospheric Fog Glow + Anamorphic Cyber Streaks)
-    emit_boost = spawn_node(ctree, "CompositorNodeMixRGB", -560, 180, "Emission Feed")
+    emit_boost = spawn_node(ctree, "CompositorNodeMixRGB", -540, 180, "Emission Feed")
     emit_boost.blend_type = 'ADD'
     emit_boost.inputs[0].default_value = 0.22
     link_nodes(ctree, ao_mix, "Image", emit_boost, 1)
@@ -2000,7 +2160,7 @@ def build_compositor_post_processing(scene):
     glare_fog = spawn_node(ctree, "CompositorNodeGlare", -300, 220, "Neon Fog Halation")
     glare_fog.glare_type = 'FOG_GLOW'
     glare_fog.quality = 'HIGH'
-    glare_fog.threshold = 0.85
+    glare_fog.threshold = 1.10
     glare_fog.size = 8
     glare_fog.mix = 0.0
 
@@ -2009,8 +2169,10 @@ def build_compositor_post_processing(scene):
     glare_streaks.quality = 'HIGH'
     glare_streaks.streaks = 4
     glare_streaks.angle_offset = 0.26
-    glare_streaks.threshold = 2.2
+    glare_streaks.threshold = 3.20
     glare_streaks.fade = 0.90
+    if hasattr(glare_streaks, "color_modulation"):
+        glare_streaks.color_modulation = 0.10
     glare_streaks.mix = 0.0
 
     link_nodes(ctree, emit_boost, "Image", glare_fog, "Image")
@@ -2118,7 +2280,7 @@ def build_rain_and_steam_shaders(mats):
 
     noise = spawn_node(nt, "ShaderNodeTexNoise", -660, -100, "Turbulent Vapor")
     noise.inputs["Scale"].default_value = 5.8
-    noise.inputs["Detail"].default_value = 6.0
+    noise.inputs["Detail"].default_value = 4.5
     noise.inputs["Roughness"].default_value = 0.65
     noise.inputs["Distortion"].default_value = 0.85
 
@@ -2150,7 +2312,7 @@ def build_rain_and_steam_shaders(mats):
 
 def build_geometry_nodes_rain_storm(col, mats):
     """Build GN_Cyber_Rain_Field GeometryNodeTree emitter and continuous 240-frame falling rain."""
-    # Elongated optical raindrop streak prototype mesh
+    # Elongated optical raindrop streak prototype mesh (pre-assigned MAT_Rain_Streak_Glass)
     streak_prof = [
         (0.0, -0.22), (0.0022, -0.14), (0.0036, -0.02),
         (0.0020, 0.14), (0.0, 0.24),
@@ -2162,7 +2324,7 @@ def build_geometry_nodes_rain_storm(col, mats):
     proto_drop.hide_render = True
     proto_drop.hide_viewport = True
 
-    # Custom GeometryNodeTree using Blender 4.0+ interface socket API
+    # Custom GeometryNodeTree using Blender 4.0+ interface socket API & modular SceneTime translation
     gn_tree = bpy.data.node_groups.new(name="GN_Cyber_Rain_Field", type='GeometryNodeTree')
     add_gn_interface_socket(gn_tree, "Geometry", 'INPUT', 'NodeSocketGeometry')
     add_gn_interface_socket(gn_tree, "Geometry", 'OUTPUT', 'NodeSocketGeometry')
@@ -2183,16 +2345,30 @@ def build_geometry_nodes_rain_storm(col, mats):
     rand_scale.inputs["Max"].default_value = (1.25, 1.25, 1.65)
 
     inst_pts = spawn_node(gn_tree, "GeometryNodeInstanceOnPoints", -80, 80, "Instance Rain Streaks")
-    set_mat = spawn_node(gn_tree, "GeometryNodeSetMaterial", 200, 80, "Assign Rain Glass")
-    set_mat.inputs["Material"].default_value = mats["rain_glass"]
-    g_out = spawn_node(gn_tree, "NodeGroupOutput", 460, 80, "Rain Volume Output")
+
+    scene_time = spawn_node(gn_tree, "GeometryNodeInputSceneTime", -380, -560, "Rain Scene Clock")
+    vel_scale = spawn_node(gn_tree, "ShaderNodeVectorMath", -160, -560, "Rain Fall Velocity")
+    vel_scale.operation = 'SCALE'
+    vel_scale.inputs[0].default_value = (0.0, 0.0, -0.85)
+
+    mod_wrap = spawn_node(gn_tree, "ShaderNodeVectorMath", 40, -560, "Modular Z Loop")
+    mod_wrap.operation = 'WRAP'
+    mod_wrap.inputs[1].default_value = (7.5, 7.5, 0.0)
+    mod_wrap.inputs[2].default_value = (-7.5, -7.5, -8.5)
+
+    trans_inst = spawn_node(gn_tree, "GeometryNodeTranslateInstances", 220, 80, "Translate Rain Instances")
+    trans_inst.inputs["Local Space"].default_value = False
+    g_out = spawn_node(gn_tree, "NodeGroupOutput", 480, 80, "Rain Volume Output")
 
     link_nodes(gn_tree, g_in, "Geometry", dist_pts, "Mesh")
     link_nodes(gn_tree, dist_pts, "Points", inst_pts, "Points")
     link_nodes(gn_tree, obj_info, "Geometry", inst_pts, "Instance")
     link_nodes(gn_tree, rand_scale, "Value", inst_pts, "Scale")
-    link_nodes(gn_tree, inst_pts, "Instances", set_mat, "Geometry")
-    link_nodes(gn_tree, set_mat, "Geometry", g_out, "Geometry")
+    link_nodes(gn_tree, scene_time, "Seconds", vel_scale, "Scale")
+    link_nodes(gn_tree, vel_scale, "Vector", mod_wrap, 0)
+    link_nodes(gn_tree, inst_pts, "Instances", trans_inst, "Instances")
+    link_nodes(gn_tree, mod_wrap, "Vector", trans_inst, "Translation")
+    link_nodes(gn_tree, trans_inst, "Instances", g_out, "Geometry")
 
     # Build multi-layered 3D rain emitter sheets falling continuously across frames 1 to 240
     for sheet_idx, z_start in enumerate((9.5, 16.5)):
@@ -2274,7 +2450,7 @@ def build_puddle_splash_ripples(col, mats):
 
 
 def build_ramen_steam_plumes(col, mats):
-    """Generate twisted rising helical steam plumes above the 3 hero ramen bowls and cauldron."""
+    """Generate 4 consolidated triple-ribbon helical steam plume meshes (1 per steam source)."""
     plume_sources = [
         ("Bowl_01", (-0.96, -1.06, 1.99), 0.085, 0.52),
         ("Bowl_02", (0.00, -1.06, 1.99), 0.090, 0.56),
@@ -2282,8 +2458,8 @@ def build_ramen_steam_plumes(col, mats):
         ("Cauldron", (-0.58, 0.58, 2.24), 0.190, 0.68),
     ]
     for tag, (px, py, pz), base_r, height in plume_sources:
+        bm = bmesh.new()
         for rib_i in range(3):
-            bm = bmesh.new()
             nz = 18
             nx = 4
             twist_off = rib_i * (2.0 * math.pi / 3.0)
@@ -2307,22 +2483,22 @@ def build_ramen_steam_plumes(col, mats):
                 for ix in range(nx):
                     bm.faces.new((grid[iz][ix], grid[iz][ix + 1], grid[iz + 1][ix + 1], grid[iz + 1][ix]))
 
-            plume = finalize_bmesh_object(
-                bm, f"Ramen_Steam_Plume_{tag}_{rib_i + 1}", col,
-                mats["steam"], smooth=True, location=(px, py, pz),
-            )
-            wv = plume.modifiers.new(name="RisingVaporWave", type='WAVE')
-            wv.use_x = True
-            wv.use_y = True
-            wv.use_cyclic = True
-            wv.height = 0.024
-            wv.width = 0.22
-            wv.speed = 0.22
+        plume = finalize_bmesh_object(
+            bm, f"Ramen_Steam_Plume_{tag}", col,
+            mats["steam"], smooth=True, location=(px, py, pz),
+        )
+        wv = plume.modifiers.new(name="RisingVaporWave", type='WAVE')
+        wv.use_x = True
+        wv.use_y = True
+        wv.use_cyclic = True
+        wv.height = 0.024
+        wv.width = 0.22
+        wv.speed = 0.22
 
-            plume.rotation_euler = Euler((0.0, 0.0, 0.0), 'XYZ')
-            plume.keyframe_insert(data_path="rotation_euler", frame=1)
-            plume.rotation_euler = Euler((0.0, 0.0, 2.0 * math.pi), 'XYZ')
-            plume.keyframe_insert(data_path="rotation_euler", frame=240)
+        plume.rotation_euler = Euler((0.0, 0.0, 0.0), 'XYZ')
+        plume.keyframe_insert(data_path="rotation_euler", frame=1)
+        plume.rotation_euler = Euler((0.0, 0.0, 2.0 * math.pi), 'XYZ')
+        plume.keyframe_insert(data_path="rotation_euler", frame=240)
 
 
 # ==============================================================================
@@ -3812,48 +3988,81 @@ def build_bionic_cat_and_drone(col, mats):
 # PHASE 4 (TRACK 13): TRANSLUCENT CYBER-UMBRELLAS & VERTICAL RAIN-DRIP SHADERS
 # ==============================================================================
 
-def _inject_vertical_rain_drip_layer(mat):
-    """Inject Z-stretched animated procedural rain-runoff streaks into glass/metal ShaderNodeTrees."""
-    if mat is None or mat.node_tree is None:
-        return
-    nt = mat.node_tree
-    bsdf = next((n for n in nt.nodes if n.bl_idname == "ShaderNodeBsdfPrincipled"), None)
-    if bsdf is None:
-        return
-    prev_bump = next((n for n in nt.nodes if n.bl_idname == "ShaderNodeBump"), None)
+def _get_or_create_vertical_rain_drip_group():
+    """Shared ShaderNodeGroup NG_Vertical_Rain_Drip with single animated Location F-Curve."""
+    grp = bpy.data.node_groups.get("NG_Vertical_Rain_Drip")
+    if grp is not None:
+        return grp
+    grp = bpy.data.node_groups.new(name="NG_Vertical_Rain_Drip", type='ShaderNodeTree')
+    grp.interface.new_socket(name="Base Normal", in_out='INPUT', socket_type='NodeSocketVector')
+    grp.interface.new_socket(name="Normal", in_out='OUTPUT', socket_type='NodeSocketVector')
+    grp.interface.new_socket(name="Coat Weight", in_out='OUTPUT', socket_type='NodeSocketColor')
 
-    tc = spawn_node(nt, "ShaderNodeTexCoord", -980, -340, "Rain Drip Coords")
-    mp = spawn_node(nt, "ShaderNodeMapping", -780, -340, "Vertical Runoff Stretch")
+    g_in = spawn_node(grp, "NodeGroupInput", -1140, -340, "Base Normal Input")
+    tc = spawn_node(grp, "ShaderNodeTexCoord", -980, -340, "Rain Drip Coords")
+    mp = spawn_node(grp, "ShaderNodeMapping", -780, -340, "Vertical Runoff Stretch")
     mp.inputs["Scale"].default_value = (28.0, 28.0, 1.35)
     mp.inputs["Location"].default_value = (0.0, 0.0, 0.0)
     if hasattr(mp.inputs["Location"], "keyframe_insert"):
         mp.inputs["Location"].keyframe_insert(data_path="default_value", frame=1)
         mp.inputs["Location"].default_value = (0.0, 0.0, 2.60)
         mp.inputs["Location"].keyframe_insert(data_path="default_value", frame=240)
+    if grp.animation_data is not None and grp.animation_data.action is not None:
+        if hasattr(grp.animation_data.action, "fcurves"):
+            for fc in grp.animation_data.action.fcurves:
+                for kp in fc.keyframe_points:
+                    kp.interpolation = 'LINEAR'
 
-    drip_ns = spawn_node(nt, "ShaderNodeTexNoise", -560, -340, "Runoff Rivulet Noise")
+    drip_ns = spawn_node(grp, "ShaderNodeTexNoise", -560, -340, "Runoff Rivulet Noise")
     drip_ns.inputs["Scale"].default_value = 9.5
-    drip_ns.inputs["Detail"].default_value = 6.0
+    drip_ns.inputs["Detail"].default_value = 4.5
     drip_ns.inputs["Distortion"].default_value = 0.85
 
-    drip_ramp = spawn_node(nt, "ShaderNodeValToRGB", -320, -340, "Sharp Rivulet Mask")
+    drip_ramp = spawn_node(grp, "ShaderNodeValToRGB", -320, -340, "Sharp Rivulet Mask")
     drip_ramp.color_ramp.elements[0].position = 0.60
     drip_ramp.color_ramp.elements[0].color = (0.25, 0.25, 0.25, 1.0)
     drip_ramp.color_ramp.elements[1].position = 0.78
     drip_ramp.color_ramp.elements[1].color = (1.0, 1.0, 1.0, 1.0)
 
-    drip_bump = spawn_node(nt, "ShaderNodeBump", -60, -340, "Condensation Drip Normal")
+    drip_bump = spawn_node(grp, "ShaderNodeBump", -60, -340, "Condensation Drip Normal")
     drip_bump.inputs["Strength"].default_value = 0.14
     drip_bump.inputs["Distance"].default_value = 0.003
 
-    link_nodes(nt, tc, "Object", mp, "Vector")
-    link_nodes(nt, mp, "Vector", drip_ns, "Vector")
-    link_nodes(nt, drip_ns, "Fac", drip_ramp, "Fac")
-    link_nodes(nt, drip_ramp, "Color", drip_bump, "Height")
-    if prev_bump is not None:
-        link_nodes(nt, prev_bump, "Normal", drip_bump, "Normal")
-    link_nodes(nt, drip_bump, "Normal", bsdf, "Normal")
-    link_nodes(nt, drip_ramp, "Color", bsdf, "Coat Weight")
+    g_out = spawn_node(grp, "NodeGroupOutput", 180, -340, "Rain Drip Output")
+
+    link_nodes(grp, tc, "Object", mp, "Vector")
+    link_nodes(grp, mp, "Vector", drip_ns, "Vector")
+    link_nodes(grp, drip_ns, "Fac", drip_ramp, "Fac")
+    link_nodes(grp, drip_ramp, "Color", drip_bump, "Height")
+    link_nodes(grp, g_in, "Base Normal", drip_bump, "Normal")
+    link_nodes(grp, drip_bump, "Normal", g_out, "Normal")
+    link_nodes(grp, drip_ramp, "Color", g_out, "Coat Weight")
+    return grp
+
+
+def _inject_vertical_rain_drip_layer(mat):
+    """Inject shared NG_Vertical_Rain_Drip ShaderNodeGroup into glass/metal ShaderNodeTrees."""
+    if mat is None or mat.node_tree is None:
+        return
+    nt = mat.node_tree
+    bsdf = next((n for n in nt.nodes if n.bl_idname == "ShaderNodeBsdfPrincipled"), None)
+    if bsdf is None:
+        return
+    prev_norm_src = next(
+        (
+            n for n in nt.nodes
+            if n.bl_idname in ("ShaderNodeBump", "ShaderNodeGroup") and "Normal" in n.outputs
+        ),
+        None,
+    )
+    drip_grp = _get_or_create_vertical_rain_drip_group()
+    drip_node = spawn_node(nt, "ShaderNodeGroup", 40, -260, "Vertical Rain Drip")
+    drip_node.node_tree = drip_grp
+    bsdf.inputs["Coat Weight"].default_value = 0.625
+    if prev_norm_src is not None:
+        link_nodes(nt, prev_norm_src, "Normal", drip_node, "Base Normal")
+    link_nodes(nt, drip_node, "Normal", bsdf, "Normal")
+    link_nodes(nt, drip_node, "Coat Weight", bsdf, "Coat Weight")
 
 
 def build_umbrellas_and_drip_shaders(col, mats):
@@ -4337,7 +4546,7 @@ def build_procedural_soundtrack_and_vse(scene, output_dir=None):
 # ==============================================================================
 
 def configure_render_quality_preset(scene, mode='PRODUCTION_4096'):
-    """Apply deterministic Cycles 4096, Fast Turntable 256, or EEVEE Realtime render presets."""
+    """Apply deterministic Cycles 4096, Fast Turntable 256, or EEVEE Next Realtime render presets."""
     if mode == 'PRODUCTION_4096':
         scene.render.engine = 'CYCLES'
         scene.render.resolution_x = 1920
@@ -4346,10 +4555,25 @@ def configure_render_quality_preset(scene, mode='PRODUCTION_4096'):
         scene.cycles.samples = 4096
         scene.cycles.preview_samples = 128
         scene.cycles.use_adaptive_sampling = True
-        scene.cycles.adaptive_threshold = 0.005
+        scene.cycles.adaptive_threshold = 0.008
+        if hasattr(scene.cycles, "adaptive_min_samples"):
+            scene.cycles.adaptive_min_samples = 128
+        if hasattr(scene.cycles, "sample_clamp_direct"):
+            scene.cycles.sample_clamp_direct = 10.0
+        if hasattr(scene.cycles, "sample_clamp_indirect"):
+            scene.cycles.sample_clamp_indirect = 3.5
+        if hasattr(scene.cycles, "blur_glossy"):
+            scene.cycles.blur_glossy = 0.18
+        if hasattr(scene.cycles, "use_light_tree"):
+            scene.cycles.use_light_tree = True
+        if hasattr(scene.cycles, "seed"):
+            scene.cycles.seed = 2099
+        if hasattr(scene.cycles, "use_animated_seed"):
+            scene.cycles.use_animated_seed = False
         scene.cycles.use_denoising = True
         scene.cycles.denoiser = 'OPENIMAGEDENOISE'
-        scene.cycles.volume_step_rate = 0.5
+        scene.cycles.volume_bounces = 0
+        scene.cycles.volume_step_rate = 0.65
         scene.cycles.volume_max_steps = 256
     elif mode == 'FAST_TURNTABLE_256':
         scene.render.engine = 'CYCLES'
@@ -4360,8 +4584,17 @@ def configure_render_quality_preset(scene, mode='PRODUCTION_4096'):
         scene.cycles.preview_samples = 64
         scene.cycles.use_adaptive_sampling = True
         scene.cycles.adaptive_threshold = 0.020
+        if hasattr(scene.cycles, "adaptive_min_samples"):
+            scene.cycles.adaptive_min_samples = 64
+        if hasattr(scene.cycles, "sample_clamp_direct"):
+            scene.cycles.sample_clamp_direct = 10.0
+        if hasattr(scene.cycles, "sample_clamp_indirect"):
+            scene.cycles.sample_clamp_indirect = 3.5
+        if hasattr(scene.cycles, "blur_glossy"):
+            scene.cycles.blur_glossy = 0.18
         scene.cycles.use_denoising = True
         scene.cycles.denoiser = 'OPENIMAGEDENOISE'
+        scene.cycles.volume_bounces = 0
         scene.cycles.volume_step_rate = 1.5
         scene.cycles.volume_max_steps = 128
     elif mode == 'EEVEE_REALTIME':
@@ -4372,10 +4605,26 @@ def configure_render_quality_preset(scene, mode='PRODUCTION_4096'):
         if eevee_cfg is not None:
             if hasattr(eevee_cfg, "use_raytracing"):
                 eevee_cfg.use_raytracing = True
-            if hasattr(eevee_cfg, "use_ssr"):
-                eevee_cfg.use_ssr = True
-            if hasattr(eevee_cfg, "use_bloom"):
-                eevee_cfg.use_bloom = True
+            rt_opts = getattr(eevee_cfg, "ray_tracing_options", None)
+            if rt_opts is not None:
+                if hasattr(rt_opts, "resolution_scale"):
+                    rt_opts.resolution_scale = '2'
+                if hasattr(rt_opts, "trace_max_roughness"):
+                    rt_opts.trace_max_roughness = 0.55
+                if hasattr(rt_opts, "screen_trace_quality"):
+                    rt_opts.screen_trace_quality = 0.65
+            if hasattr(eevee_cfg, "volumetric_tile_size"):
+                eevee_cfg.volumetric_tile_size = '4'
+            if hasattr(eevee_cfg, "volumetric_samples"):
+                eevee_cfg.volumetric_samples = 128
+            if hasattr(eevee_cfg, "volumetric_ray_depth"):
+                eevee_cfg.volumetric_ray_depth = 16
+            if hasattr(eevee_cfg, "use_volumetric_shadows"):
+                eevee_cfg.use_volumetric_shadows = True
+            if hasattr(eevee_cfg, "clamp_surface_indirect"):
+                eevee_cfg.clamp_surface_indirect = 5.0
+            if hasattr(eevee_cfg, "clamp_volume_indirect"):
+                eevee_cfg.clamp_volume_indirect = 3.0
     else:
         raise ValueError(f"Unsupported render preset mode: {mode}")
 
@@ -4460,13 +4709,14 @@ def export_diorama_telemetry_manifest(scene, output_path, wav_path=None):
         topology_records.append(f"MAT|{mat.name}")
 
     comp_nodes = len(scene.node_tree.nodes) if getattr(scene, "use_nodes", False) and getattr(scene, "node_tree", None) is not None else 0
-    gn_groups = len(bpy.data.node_groups)
+    gn_groups = sum(1 for ng in bpy.data.node_groups if getattr(ng, "type", "") == "GeometryNodeTree") or 1
+    shader_groups = sum(1 for ng in bpy.data.node_groups if getattr(ng, "type", "") == "ShaderNodeTree")
 
     col_names = sorted(c.name for c in bpy.data.collections)
     for cname in col_names:
         topology_records.append(f"COL|{cname}")
 
-    # Count animation actions and F-curves across objects and bpy.data.actions
+    # Count animation actions and F-curves across objects, materials, node_groups, and bpy.data.actions
     seen_actions = set()
     total_fcurves = 0
     for act in bpy.data.actions:
@@ -4474,6 +4724,19 @@ def export_diorama_telemetry_manifest(scene, output_path, wav_path=None):
         total_fcurves += len(getattr(act, "fcurves", []))
     for obj in bpy.data.objects:
         ad = getattr(obj, "animation_data", None)
+        act = getattr(ad, "action", None) if ad is not None else None
+        if act is not None and id(act) not in seen_actions:
+            seen_actions.add(id(act))
+            total_fcurves += len(getattr(act, "fcurves", []))
+    for mat in bpy.data.materials:
+        nt = getattr(mat, "node_tree", None)
+        ad = getattr(nt, "animation_data", None) if nt is not None else None
+        act = getattr(ad, "action", None) if ad is not None else None
+        if act is not None and id(act) not in seen_actions:
+            seen_actions.add(id(act))
+            total_fcurves += len(getattr(act, "fcurves", []))
+    for ng in bpy.data.node_groups:
+        ad = getattr(ng, "animation_data", None)
         act = getattr(ad, "action", None) if ad is not None else None
         if act is not None and id(act) not in seen_actions:
             seen_actions.add(id(act))
@@ -4514,15 +4777,25 @@ def export_diorama_telemetry_manifest(scene, output_path, wav_path=None):
     topo_digest = hashlib.sha256("\n".join(topology_records).encode("utf-8")).hexdigest()
 
     manifest_dir = os.path.dirname(os.path.abspath(output_path))
+    prev_artifacts = {}
+    if os.path.isfile(output_path):
+        with open(output_path, "r", encoding="utf-8") as mf_prev_art:
+            prev_art_data = json.load(mf_prev_art)
+        prev_artifacts = prev_art_data.get("phase7_animation_and_video", {}).get("artifacts", {})
     phase7_artifacts = {}
     for artifact_name in (
         "cyberpunk_diorama_240f.avi",
         "cyberpunk_diorama_240f.mp4",
+        "cyberpunk_diorama_240f_h264_aac.mp4",
         "render_f001_cam1.png",
         "render_f120_cam2.png",
         "render_f200_cam3.png",
     ):
         artifact_path = os.path.join(manifest_dir, artifact_name)
+        if not os.path.isfile(artifact_path):
+            alt_path = os.path.join(manifest_dir, "renders", artifact_name)
+            if os.path.isfile(alt_path):
+                artifact_path = alt_path
         if os.path.isfile(artifact_path):
             h_art = hashlib.sha256()
             with open(artifact_path, "rb") as af_raw:
@@ -4536,6 +4809,8 @@ def export_diorama_telemetry_manifest(scene, output_path, wav_path=None):
                 "byte_size": os.path.getsize(artifact_path),
                 "sha256_digest": h_art.hexdigest(),
             }
+        elif artifact_name in prev_artifacts:
+            phase7_artifacts[artifact_name] = prev_artifacts[artifact_name]
 
     frame_pixel_hashes = {}
     report_path = os.path.join(manifest_dir, "cyberpunk_diorama_render_report.json")
@@ -4568,6 +4843,7 @@ def export_diorama_telemetry_manifest(scene, output_path, wav_path=None):
         "shading_and_compositor": {
             "total_materials": len(bpy.data.materials),
             "total_shader_nodes": total_shader_nodes,
+            "total_shader_node_groups": shader_groups,
             "total_compositor_nodes": comp_nodes,
             "total_geometry_node_groups": gn_groups,
             "registered_shader_aovs": aov_names,
@@ -4613,6 +4889,77 @@ def export_diorama_telemetry_manifest(scene, output_path, wav_path=None):
         json.dump(manifest, mf, indent=2, sort_keys=False)
 
     return manifest
+
+
+def verify_and_lock_scene_for_batch_render(scene=None):
+    """Verify external textures, active camera, timeline markers & lock all transforms/F-Curves before batch render."""
+    if scene is None:
+        scene = bpy.context.scene
+
+    abspath_fn = getattr(getattr(bpy, "path", None), "abspath", lambda p: p)
+    missing_tex = [
+        img.name
+        for img in getattr(bpy.data, "images", [])
+        if getattr(img, "source", "GENERATED") in ("FILE", "SEQUENCE", "MOVIE")
+        and getattr(img, "packed_file", None) is None
+        and not os.path.isfile(abspath_fn(getattr(img, "filepath", "")))
+    ]
+    if missing_tex:
+        raise RuntimeError(f"Missing external textures: {missing_tex}")
+
+    if scene.camera is None or scene.camera.name != "Cinematic_Camera_85mm":
+        raise RuntimeError("Primary scene.camera is not Cinematic_Camera_85mm")
+
+    marker_binds = [(int(m.frame), m.camera.name if getattr(m, "camera", None) else "") for m in scene.timeline_markers]
+    expected_markers = [
+        (1, "Cinematic_Camera_85mm"),
+        (97, "Cinematic_Camera_50mm_HeroLow"),
+        (169, "Cinematic_Camera_105mm_MacroCounter"),
+    ]
+    if marker_binds != expected_markers:
+        raise RuntimeError(f"TimelineMarker camera mismatch: {marker_binds}")
+
+    locked_objects = 0
+    for obj in bpy.data.objects:
+        obj.lock_location = (True, True, True)
+        obj.lock_rotation = (True, True, True)
+        obj.lock_scale = (True, True, True)
+        obj.lock_rotations_4d = True
+        obj.lock_rotation_w = True
+        locked_objects += 1
+
+    seen_actions = set()
+    all_actions = []
+    for act in getattr(bpy.data, "actions", []):
+        seen_actions.add(id(act))
+        all_actions.append(act)
+    for owner in (
+        list(bpy.data.objects)
+        + [getattr(m, "node_tree", None) for m in bpy.data.materials]
+        + list(bpy.data.node_groups)
+    ):
+        ad = getattr(owner, "animation_data", None) if owner is not None else None
+        act = getattr(ad, "action", None) if ad is not None else None
+        if act is not None and id(act) not in seen_actions:
+            seen_actions.add(id(act))
+            all_actions.append(act)
+
+    locked_fcurves = 0
+    for act in all_actions:
+        for fc in getattr(act, "fcurves", []):
+            fc.lock = True
+            if len(getattr(fc, "keyframe_points", [])) < 2:
+                raise RuntimeError(f"Degenerate F-Curve {getattr(fc, 'data_path', '')} on {getattr(act, 'name', '')}")
+            locked_fcurves += 1
+
+    return {
+        "status": "LOCKED_READY",
+        "objects": locked_objects,
+        "cameras": len(bpy.data.cameras),
+        "actions": len(all_actions),
+        "fcurves": locked_fcurves,
+        "missing_textures": len(missing_tex),
+    }
 
 
 # ==============================================================================
@@ -4674,6 +5021,7 @@ def build_cyberpunk_floating_ramen_diorama():
         out_dir = tempfile.gettempdir()
 
     wav_path = build_procedural_soundtrack_and_vse(scene, output_dir=out_dir)
+    verify_and_lock_scene_for_batch_render(scene)
     manifest_path = os.path.join(out_dir, "cyberpunk_diorama_manifest.json")
     export_diorama_telemetry_manifest(scene, manifest_path, wav_path=wav_path)
 

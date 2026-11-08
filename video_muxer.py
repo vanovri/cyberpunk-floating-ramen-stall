@@ -17,10 +17,10 @@ Outputs: ``cyberpunk_diorama_240f.avi``
              > idx1 keyframe index.
          ``cyberpunk_diorama_240f.mp4``
              ftyp(isom) > mdat > moov(mvhd, video trak[tkhd, mdia(mdhd, hdlr,
-             minf(vmhd, dinf, stbl(stsd/avc1+avcC, stts, stss, stsc, stsz, stco)))],
+             minf(vmhd, dinf, stbl(stsd/avc1+avcC+colr(nclx), stts, stss, stsc, stsz, stco)))],
              audio trak[... stsd/sowt 48 kHz stereo 16-bit PCM ...]).
              Video is a valid H.264 Constrained-Baseline bitstream: one IDR slice
-             per frame whose macroblocks are all I_PCM (lossless 4:2:0 BT.601
+             per frame whose macroblocks are all I_PCM (lossless 4:2:0 BT.709
              limited-range samples), stored AVCC length-prefixed.
          ``cyberpunk_diorama_240f_h264_aac.mp4`` (optional, ffmpeg on PATH).
 
@@ -278,7 +278,7 @@ def build_sps(width, height, fps, level_idc=42):
     bw.u(1, 1)                  # colour_description_present_flag
     bw.u(8, 1)                  # colour_primaries BT.709
     bw.u(8, 1)                  # transfer_characteristics BT.709
-    bw.u(8, 6)                  # matrix_coefficients BT.601 (SMPTE 170M)
+    bw.u(8, 1)                  # matrix_coefficients BT.709 (ITU-R BT.709-6)
     bw.u(1, 0)                  # chroma_loc_info_present_flag
     bw.u(1, 1)                  # timing_info_present_flag
     bw.u(32, 1)                 # num_units_in_tick
@@ -313,13 +313,13 @@ def build_pps():
     return nal(3, 8, bw.tobytes())
 
 
-_Y_R = [66 * i for i in range(256)]
-_Y_G = [129 * i for i in range(256)]
-_Y_B = [25 * i + 128 for i in range(256)]
+_Y_R = [47 * i for i in range(256)]
+_Y_G = [157 * i for i in range(256)]
+_Y_B = [16 * i + 128 for i in range(256)]
 
 
 def rgb_to_yuv420(rgb, width, height):
-    """BT.601 limited-range 8-bit Y'CbCr 4:2:0 planes (values stay in 16..240, never 0)."""
+    """BT.709 limited-range 8-bit Y'CbCr 4:2:0 planes (values stay in 16..240, never 0)."""
     r = rgb[0::3]
     g = rgb[1::3]
     b = rgb[2::3]
@@ -338,8 +338,8 @@ def rgb_to_yuv420(rgb, width, height):
             gs = g[i0] + g[i0 + 1] + g[i1] + g[i1 + 1]
             bs = b[i0] + b[i0 + 1] + b[i1] + b[i1 + 1]
             j = cy * cw + cx
-            U[j] = ((-38 * rs - 74 * gs + 112 * bs + 512) >> 10) + 128
-            V[j] = ((112 * rs - 94 * gs - 18 * bs + 512) >> 10) + 128
+            U[j] = ((-26 * rs - 87 * gs + 112 * bs + 512) >> 10) + 128
+            V[j] = ((112 * rs - 102 * gs - 10 * bs + 512) >> 10) + 128
     return Y, bytes(U), bytes(V)
 
 
@@ -421,12 +421,19 @@ def _avcc(sps, pps):
                + bytes([1]) + struct.pack(">H", len(pps)) + pps)
 
 
+def _colr_nclx(primaries=1, transfer=1, matrix=1, full_range=0):
+    return box(
+        b"colr",
+        b"nclx" + struct.pack(">HHH", primaries, transfer, matrix) + bytes([(1 if full_range else 0) << 7]),
+    )
+
+
 def _avc1(width, height, sps, pps):
     name = b"GodMode I_PCM H.264"
     comp = bytes([len(name)]) + name + b"\x00" * (31 - len(name))
     payload = (b"\x00" * 6 + struct.pack(">H", 1) + struct.pack(">HH", 0, 0) + b"\x00" * 12
                + struct.pack(">HHIIIH", width, height, 0x00480000, 0x00480000, 0, 1) + comp
-               + struct.pack(">Hh", 0x0018, -1) + _avcc(sps, pps))
+               + struct.pack(">Hh", 0x0018, -1) + _avcc(sps, pps) + _colr_nclx(1, 1, 1, 0))
     return box(b"avc1", payload)
 
 
@@ -524,8 +531,16 @@ def ffmpeg_transcode(src_path, wav_path, out_path):
     exe = shutil.which("ffmpeg")
     if exe is None:
         return {"available": False}
-    cmd = [exe, "-y", "-v", "error", "-i", src_path, "-c:v", "libx264", "-preset", "slow", "-crf", "16",
-           "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", out_path]
+    cmd = [
+        exe, "-y", "-v", "error", "-i", src_path,
+        "-vf", "scale=out_color_matrix=bt709:out_range=tv",
+        "-c:v", "libx264", "-preset", "slow", "-crf", "16",
+        "-pix_fmt", "yuv420p",
+        "-colorspace", "bt709", "-color_primaries", "bt709",
+        "-color_trc", "bt709", "-color_range", "tv",
+        "-x264-params", "colorprim=bt709:transfer=bt709:colormatrix=bt709:fullrange=off",
+        "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", out_path,
+    ]
     proc = subprocess.run(cmd, capture_output=True, text=True)
     ok = proc.returncode == 0 and os.path.isfile(out_path)
     return {"available": True, "ok": ok, "path": out_path if ok else None,

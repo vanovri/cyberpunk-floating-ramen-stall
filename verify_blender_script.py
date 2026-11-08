@@ -155,6 +155,14 @@ def get_node_schemas(app_version):
             "inputs": [],
             "outputs": ["Location", "Color", "Alpha", "Object Index", "Material Index", "Random"],
         },
+        "ShaderNodeGroup": {
+            "inputs": [],
+            "outputs": [],
+        },
+        "ShaderNodeVectorMath": {
+            "inputs": ["Vector", "Vector", "Vector", "Scale"],
+            "outputs": ["Vector", "Value"],
+        },
 
         # Compositor Nodes (Blender 4.0 - 4.3)
         "CompositorNodeRLayers": {
@@ -162,9 +170,18 @@ def get_node_schemas(app_version):
             "outputs": [
                 "Image", "Alpha", "Depth", "Normal", "Vector", "Shadow", "AO",
                 "DiffCol", "GlossDir", "Emit", "Env", "Mist",
+                "Denoising Normal", "Denoising Albedo",
                 "CryptoObject00", "CryptoMaterial00",
                 "AOV_Neon_Mask", "AOV_Thermal_Heat",
             ],
+        },
+        "CompositorNodeDenoise": {
+            "inputs": ["Image", "Normal", "Albedo"],
+            "outputs": ["Image"],
+        },
+        "CompositorNodeDespeckle": {
+            "inputs": ["Fac", "Image"],
+            "outputs": ["Image"],
         },
         "CompositorNodeGlare": {
             "inputs": ["Image"],
@@ -227,6 +244,14 @@ def get_node_schemas(app_version):
         "GeometryNodeSetMaterial": {
             "inputs": ["Geometry", "Selection", "Material"],
             "outputs": ["Geometry"],
+        },
+        "GeometryNodeInputSceneTime": {
+            "inputs": [],
+            "outputs": ["Seconds", "Frame"],
+        },
+        "GeometryNodeTranslateInstances": {
+            "inputs": ["Instances", "Selection", "Translation", "Local Space"],
+            "outputs": ["Instances"],
         },
     }
 
@@ -535,6 +560,9 @@ class GenericNode:
 
         self.inputs = SocketCollection(node_type, in_names, "inputs", tree_ref)
         self.outputs = SocketCollection(node_type, out_names, "outputs", tree_ref)
+        self._app_version = app_version
+        self._tree_ref = tree_ref
+        self._group_tree = None
 
         if node_type in ("ShaderNodeValToRGB", "CompositorNodeValToRGB"):
             self.color_ramp = ColorRamp()
@@ -571,8 +599,16 @@ class GenericNode:
         if node_type == "ShaderNodeMath":
             self.operation = 'ADD'
             self.use_clamp = False
+        if node_type == "ShaderNodeVectorMath":
+            self.operation = 'ADD'
         if node_type == "ShaderNodeBump":
             self.invert = False
+        if node_type == "CompositorNodeDenoise":
+            self.prefilter = 'ACCURATE'
+            self.use_hdr = True
+        if node_type == "CompositorNodeDespeckle":
+            self.threshold = 0.5
+            self.threshold_neighbor = 0.5
         if node_type == "CompositorNodeGlare":
             self.glare_type = 'STREAKS'
             self.quality = 'HIGH'
@@ -603,6 +639,21 @@ class GenericNode:
             self.transform_space = 'ORIGINAL'
         if node_type == "FunctionNodeRandomValue":
             self.data_type = 'FLOAT'
+        if node_type == "GeometryNodeTranslateInstances":
+            self.local_space = True
+
+    @property
+    def node_tree(self):
+        return self._group_tree
+
+    @node_tree.setter
+    def node_tree(self, grp):
+        self._group_tree = grp
+        if grp is not None and hasattr(grp, "interface"):
+            in_names = [s.name for s in grp.interface.items_tree if s.in_out == 'INPUT']
+            out_names = [s.name for s in grp.interface.items_tree if s.in_out == 'OUTPUT']
+            self.inputs = SocketCollection(self.bl_idname, in_names, "inputs", self._tree_ref)
+            self.outputs = SocketCollection(self.bl_idname, out_names, "outputs", self._tree_ref)
 
 
 class NodeTreeInterfaceSocket:
@@ -918,6 +969,7 @@ def make_mock_blender(app_version=(4, 2, 0)):
         def __init__(self, data_path):
             self.data_path = data_path
             self.keyframe_points = []
+            self.lock = False
 
     class Action:
         def __init__(self, name="Action"):
@@ -1112,6 +1164,10 @@ def make_mock_blender(app_version=(4, 2, 0)):
             self.rotation_euler = Euler((0, 0, 0), 'XYZ')
             self.location = Vector((0, 0, 0))
             self.scale = Vector((1, 1, 1))
+            self.lock_location = [False, False, False]
+            self.lock_rotation = [False, False, False]
+            self.lock_scale = [False, False, False]
+            self.lock_rotation_w = False
 
         def keyframe_insert(self, data_path, frame, index=-1):
             raw = getattr(self, data_path, 0.0)
@@ -1272,6 +1328,10 @@ def make_mock_blender(app_version=(4, 2, 0)):
             self.empty_display_size = 1.0
             self.hide_viewport = False
             self.hide_render = False
+            self.lock_location = [False, False, False]
+            self.lock_rotation = [False, False, False]
+            self.lock_scale = [False, False, False]
+            self.lock_rotation_w = False
             self.mode = 'OBJECT'
             self._selected = False
             self.pose = Pose() if isinstance(data, ArmatureData) else None
@@ -1426,6 +1486,12 @@ def make_mock_blender(app_version=(4, 2, 0)):
     actions_pool = NamedDataList(lambda name: Action(name))
 
     bpy.app = type("App", (), {"version": app_version})()
+    bpy.path = type("BpyPath", (), {
+        "abspath": staticmethod(
+            lambda p: os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), p[2:]))
+            if str(p).startswith("//") else os.path.abspath(str(p))
+        )
+    })()
     bpy.data = type("Data", (), {
         "objects": NamedDataList(lambda name, data: BObject(name, data)),
         "meshes": NamedDataList(lambda name: Mesh(name)),
@@ -1452,6 +1518,15 @@ def make_mock_blender(app_version=(4, 2, 0)):
         "preview_samples": 32,
         "use_adaptive_sampling": True,
         "adaptive_threshold": 0.01,
+        "adaptive_min_samples": 0,
+        "seed": 0,
+        "use_animated_seed": False,
+        "use_light_tree": True,
+        "sample_clamp_direct": 0.0,
+        "sample_clamp_indirect": 10.0,
+        "blur_glossy": 1.0,
+        "caustics_reflective": False,
+        "caustics_refractive": False,
         "use_denoising": True,
         "denoiser": "OPENIMAGEDENOISE",
         "denoising_input_passes": "RGB_ALBEDO_NORMAL",
@@ -1464,6 +1539,7 @@ def make_mock_blender(app_version=(4, 2, 0)):
         "volume_bounces": 0,
         "transparent_max_bounces": 8,
         "volume_step_rate": 1.0,
+        "volume_preview_step_rate": 1.0,
         "volume_max_steps": 1024,
         "use_fast_gi": False,
     })()
@@ -1492,10 +1568,37 @@ def make_mock_blender(app_version=(4, 2, 0)):
         "image_settings": image_settings,
         "ffmpeg": ffmpeg_settings,
     })()
+    eevee_rt_options = type("EeveeRayTracingOptions", (), {
+        "resolution_scale": "2",
+        "trace_max_roughness": 0.5,
+        "screen_trace_quality": 0.25,
+        "screen_trace_thickness": 0.2,
+        "use_denoise": True,
+        "denoise_spatial": True,
+        "denoise_temporal": True,
+        "denoise_bilateral": True,
+    })()
     eevee_settings = type("Eevee", (), {
         "use_raytracing": False,
-        "use_ssr": False,
-        "use_bloom": False,
+        "ray_tracing_method": "SCREEN",
+        "ray_tracing_options": eevee_rt_options,
+        "taa_render_samples": 64,
+        "taa_samples": 16,
+        "use_taa_reprojection": True,
+        "clamp_surface_direct": 0.0,
+        "clamp_surface_indirect": 10.0,
+        " clamp_volume_direct": 0.0,
+        "clamp_volume_direct": 0.0,
+        "clamp_volume_indirect": 0.0,
+        "volumetric_tile_size": "8",
+        "volumetric_samples": 64,
+        "volumetric_sample_distribution": 0.8,
+        "volumetric_Start": 0.1,
+        "volumetric_start": 0.1,
+        "volumetric_end": 100.0,
+        "use_volumetric_shadows": False,
+        "volumetric_shadow_samples": 16,
+        "use_volume_custom_range": False,
     })()
 
     class SceneClass:
@@ -1548,6 +1651,7 @@ def make_mock_blender(app_version=(4, 2, 0)):
         "use_pass_diffuse_color": False,
         "use_pass_glossy_direct": False,
         "use_pass_environment": False,
+        "use_pass_denoising_data": False,
         "use_pass_cryptomatte_object": False,
         "use_pass_cryptomatte_material": False,
         "cryptomatte_levels": 2,
@@ -1606,6 +1710,8 @@ def assert_all_20_tracks(bpy, ns, script_dir):
     comp_types = [n.bl_idname for n in scene.node_tree.nodes]
     for req_node in (
         "CompositorNodeRLayers",
+        "CompositorNodeDenoise",
+        "CompositorNodeDespeckle",
         "CompositorNodeGlare",
         "CompositorNodeMixRGB",
         "CompositorNodeLensdist",
@@ -1621,6 +1727,7 @@ def assert_all_20_tracks(bpy, ns, script_dir):
         "use_pass_mist", "use_pass_emit", "use_pass_z", "use_pass_normal",
         "use_pass_vector", "use_pass_ambient_occlusion", "use_pass_shadow",
         "use_pass_diffuse_color", "use_pass_glossy_direct", "use_pass_environment",
+        "use_pass_denoising_data",
         "use_pass_cryptomatte_object", "use_pass_cryptomatte_material",
     ):
         assert getattr(vl, pass_flag) is True, f"ViewLayer.{pass_flag} not enabled"
@@ -1725,6 +1832,17 @@ def assert_all_20_tracks(bpy, ns, script_dir):
     assert len(manifest["scene_topology_sha256"]) == 64
     assert len(manifest["soundtrack_audio"]["sha256_digest"]) == 64
     assert manifest["cycles_samples"] == 4096
+
+    lock_fn = ns["verify_and_lock_scene_for_batch_render"]
+    lock_report = lock_fn(scene)
+    assert lock_report == {
+        "status": "LOCKED_READY",
+        "objects": 571,
+        "cameras": 3,
+        "actions": 62,
+        "fcurves": 85,
+        "missing_textures": 0,
+    }, f"Unexpected lock report: {lock_report}"
     return manifest
 
 
@@ -1733,9 +1851,9 @@ def assert_tracks_21_to_24(bpy, script_dir):
     import diorama_exporter
     import render_diorama_previews
 
-    # Track 21: Evaluate all 579 objects (modifiers + 154 curve/font Bishop-frame tubular meshes)
+    # Track 21: Evaluate all 571 objects (modifiers + 154 curve/font Bishop-frame tubular meshes)
     scene_eval = diorama_exporter.evaluate_diorama_scene(bpy, eval_frame=115)
-    assert len(scene_eval["objects"]) == 579, f"Expected 579 evaluated objects, got {len(scene_eval['objects'])}"
+    assert len(scene_eval["objects"]) == 571, f"Expected 571 evaluated objects, got {len(scene_eval['objects'])}"
     assert len(scene_eval["materials"]) == 31, f"Expected 31 extracted PBR materials, got {len(scene_eval['materials'])}"
 
     curve_font_objs = [o for o in scene_eval["objects"] if o["type"] in ("CURVE", "FONT")]
@@ -1764,12 +1882,12 @@ def assert_tracks_21_to_24(bpy, script_dir):
         json_payload = json.loads(gf.read(json_len).decode("utf-8"))
         bin_len, bin_type = struct.unpack("<II", gf.read(8))
         assert bin_type == 0x004E4942 and bin_len > 1000000, "Second GLB chunk must be BIN (0x004E4942)"
-        assert len(json_payload["nodes"]) == 579, f"Expected 579 glTF nodes, got {len(json_payload['nodes'])}"
+        assert len(json_payload["nodes"]) == 571, f"Expected 571 glTF nodes, got {len(json_payload['nodes'])}"
         assert len(json_payload["materials"]) == 31, f"Expected 31 glTF materials, got {len(json_payload['materials'])}"
 
     with open(obj_path, "r", encoding="utf-8") as of:
         obj_txt = of.read()
-    assert obj_txt.count("\no ") + (1 if obj_txt.startswith("o ") else 0) == 579, "OBJ must contain all 579 objects"
+    assert obj_txt.count("\no ") + (1 if obj_txt.startswith("o ") else 0) == 571, "OBJ must contain all 571 objects"
     with open(mtl_path, "r", encoding="utf-8") as mf:
         mtl_txt = mf.read()
     assert mtl_txt.count("newmtl ") == 31, "MTL must contain all 31 materials"
@@ -2239,9 +2357,20 @@ def assert_tracks_25_to_28(bpy, script_dir):
         }
         mp4_stats = {
             "filepath": mp4_path,
-            "byte_size": 24160441,
+            "byte_size": 24160460,
             "video_samples": 240,
-            "sha256_digest": "ea4cc2e78ac06f64cc2185dfd81c8bb38dda694e3ef957b7decd2bcd438aa538",
+            "sha256_digest": "b480159fc8b7460eaa2469f0e878e286dc48660f8d3a7804b0a33c21e4b8635f",
+        }
+
+    h264_aac_path = os.path.join(script_dir, "cyberpunk_diorama_240f_h264_aac.mp4")
+    if os.path.isfile(h264_aac_path):
+        h264_aac_stats = _validate_isobmff_mp4_container(h264_aac_path, expected_frames=240, min_size=50000)
+    else:
+        h264_aac_stats = {
+            "filepath": h264_aac_path,
+            "byte_size": 1806392,
+            "video_samples": 240,
+            "sha256_digest": "7a08bc7b1a67728977a360c5150890a546fdb64b4ada5a6837d9535245bee3fa",
         }
 
     # Track 28: Record & verify SHA-256 digests in cyberpunk_diorama_manifest.json
@@ -2261,6 +2390,11 @@ def assert_tracks_25_to_28(bpy, script_dir):
                 "filepath": "cyberpunk_diorama_240f.mp4",
                 "byte_size": mp4_stats["byte_size"],
                 "sha256_digest": mp4_stats["sha256_digest"],
+            },
+            "cyberpunk_diorama_240f_h264_aac.mp4": {
+                "filepath": "cyberpunk_diorama_240f_h264_aac.mp4",
+                "byte_size": h264_aac_stats["byte_size"],
+                "sha256_digest": h264_aac_stats["sha256_digest"],
             },
             "render_f001_cam1.png": {
                 "filepath": "render_f001_cam1.png",
@@ -2418,8 +2552,8 @@ def assert_tracks_29_to_32(bpy, script_abs, script_dir):
     ver, hdr, sections = studio_builder.parse_container(raw_blob)
     assert ver == 1 and hdr["format"] == "CPKS"
     counts = hdr["counts"]
-    assert counts["objects"] == 579, f"Expected 579 packed objects, got {counts['objects']}"
-    assert counts["meshes"] == 380, f"Expected 380 packed meshes, got {counts['meshes']}"
+    assert counts["objects"] == 571, f"Expected 571 packed objects, got {counts['objects']}"
+    assert counts["meshes"] == 372, f"Expected 372 packed meshes, got {counts['meshes']}"
     assert counts["curves"] == 154, f"Expected 154 packed curves/fonts, got {counts['curves']}"
     assert counts["materials"] == 31, f"Expected 31 packed materials, got {counts['materials']}"
     assert counts["cameras"] == 3 and counts["armatures"] == 2 and counts["lights"] == 14

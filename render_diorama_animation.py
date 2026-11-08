@@ -598,6 +598,8 @@ def resolve_material(mat):
         if node is None or depth > 6:
             return _rgb(sock.default_value)
         t = node.bl_idname
+        if t == "ShaderNodeGroup":
+            return _rgb(sock.default_value)
         if t == "ShaderNodeValToRGB":
             cols = [tuple(e.color[:3]) for e in node.color_ramp.elements]
             if emissive:
@@ -627,6 +629,14 @@ def resolve_material(mat):
             except TypeError:
                 return None
         t = node.bl_idname
+        if t == "ShaderNodeGroup":
+            v = sock.default_value
+            if v is None:
+                return None
+            try:
+                return float(v)
+            except TypeError:
+                return None
         if t == "ShaderNodeValToRGB":
             cols = [e.color for e in node.color_ramp.elements]
             return sum(c[0] * 0.2126 + c[1] * 0.7152 + c[2] * 0.0722 for c in cols) / len(cols)
@@ -2256,6 +2266,7 @@ def main(argv=None):
             manifest_data = json.load(mfh)
         p7_art = {}
         for aname in ("cyberpunk_diorama_240f.avi", "cyberpunk_diorama_240f.mp4",
+                      "cyberpunk_diorama_240f_h264_aac.mp4",
                       "render_f001_cam1.png", "render_f120_cam2.png", "render_f200_cam3.png"):
             apath = os.path.join(out_dir, aname)
             if os.path.isfile(apath):
